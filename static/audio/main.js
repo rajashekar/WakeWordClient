@@ -154,38 +154,41 @@ function gotStream(stream) {
                 if (arrayBuffer.length / SAMPLE_RATE * 1000 > windowSize) {
                     arrayBuffer = arrayBuffer.slice(0, windowBufferSize)
                 }
-                // arrayBuffer = arrayBuffer.filter(x => x/audioFloatSize)
+                arrayBuffer = arrayBuffer.filter(x => x/audioFloatSize)
                 // calculate log mels
                 log_mels = melSpectrogram(arrayBuffer, {
                     sampleRate: SAMPLE_RATE,
                     hopLength: SPEC_HOP_LENGTH,
                     nMels: MEL_SPEC_BINS,
-                    nFft: NUM_FFTS,
-                    fMin: 60,
+                    nFft: NUM_FFTS
                 });
-                // convert to nd array
-                let nd_mels = ndarray(flatten(log_mels), [MEL_SPEC_BINS, log_mels.length])
-                // create empty [1,1,40,61]
+                // we will get 61 arrays of each 40 length
+                // convert to nd array of 61x40
+                let nd_mels = ndarray(flatten(log_mels), [log_mels.length, MEL_SPEC_BINS])
+                // create empty [1,1,40,61] - This is model takes input
                 let dataProcessed = ndarray(new Float32Array(MEL_SPEC_BINS * log_mels.length * channels), [1, channels, MEL_SPEC_BINS, log_mels.length])
-                // fill last 2 dims - 40 x 61 - [1, 1, 40, 61]
-                ndarray.ops.assign(dataProcessed.pick(0, 0, null, null), nd_mels.pick(null,  null));
+                // convert [61, 40] to [1, 1, 40, 61]
+                ndarray.ops.assign(dataProcessed.pick(0, 0, null, null), nd_mels.transpose(1,0).pick(null,  null));
                 let inputTensor = new onnx.Tensor(dataProcessed.data, 'float32', dataProcessed.shape);
                 // Run model with Tensor inputs and get the result.
                 let outputMap = await session.run([inputTensor]);
                 let outputData = outputMap.values().next().value.data;
                 let scores = Array.from(outputData)
+                // add weights
+                console.log("scores", scores)
                 let probs = softmax(scores)
-                probs = probs.filter(x => x/probs.reduce( (sum, x) => x+sum))
+                probs_sum = probs.reduce( (sum, x) => x+sum)
+                probs = probs.filter(x => x/probs_sum)
                 let class_idx = argMax(probs)
-                console.log(wakeWords[class_idx])
-                console.log(probs)
+                console.log("probabilities", probs)
+                console.log("predicted word", wakeWords[class_idx])
                 if (wakeWords[targetState] == wakeWords[class_idx]) {
                     console.log(wakeWords[class_idx])
                     addprediction(wakeWords[class_idx])
                     predictWords.push(word) 
                     targetState += 1
                     if (wakeWords.join(' ') == predictWords.join(' ')) {
-                        addprediction(predictWords.join(' '))
+                        addprediction(`Wake word detected - ${predictWords.join(' ')}`)
                         predictWords = []
                         targetState = 0
                     }
