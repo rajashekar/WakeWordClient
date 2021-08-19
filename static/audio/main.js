@@ -154,7 +154,7 @@ function gotStream(stream) {
                 if (arrayBuffer.length / SAMPLE_RATE * 1000 > windowSize) {
                     arrayBuffer = arrayBuffer.slice(0, windowBufferSize)
                 }
-                arrayBuffer = arrayBuffer.filter(x => x/audioFloatSize)
+                // arrayBuffer = arrayBuffer.filter(x => x/audioFloatSize)
                 // calculate log mels
                 log_mels = melSpectrogram(arrayBuffer, {
                     sampleRate: SAMPLE_RATE,
@@ -185,7 +185,7 @@ function gotStream(stream) {
                 if (wakeWords[targetState] == wakeWords[class_idx]) {
                     console.log(wakeWords[class_idx])
                     addprediction(wakeWords[class_idx])
-                    predictWords.push(word) 
+                    predictWords.push(wakeWords[class_idx]) 
                     targetState += 1
                     if (wakeWords.join(' ') == predictWords.join(' ')) {
                         addprediction(`Wake word detected - ${predictWords.join(' ')}`)
