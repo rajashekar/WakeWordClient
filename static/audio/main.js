@@ -9,24 +9,27 @@ var rafID = null;
 var analyserContext = null;
 var canvasWidth, canvasHeight;
 
-const wakeWords = ["hey", "fourth", "brain", "oov"]
+const classes = ["hey", "fourth", "brain", "oov"]
+const wakeWords = ["hey", "fourth", "brain"]
 const bufferSize = 1024
 const channels = 1
 const windowSize = 750
 const zmuv_mean = 0.000016
 const zmuv_std = 0.072771
 const bias = 1e-7
-const batches = 1
 const SPEC_HOP_LENGTH = 200;
 const MEL_SPEC_BINS = 40;
 const NUM_FFTS = 512;
 const audioFloatSize = 32767
+const sampleRate = 16000
+const numOfBatches = 3
 
 let predictWords = []
 let arrayBuffer = []
 let targetState = 0
+let pauseStreaming = false
 
-const windowBufferSize = Math.ceil(SAMPLE_RATE / bufferSize * windowSize /1000) * 1000
+const windowBufferSize = windowSize/1000 * sampleRate
 
 let session;
 async function loadModel() {
@@ -109,8 +112,8 @@ function updateAnalysers(time) {
 
 function flatten(log_mels) {
     flatten_arry = []
-    for(i = 0; i < log_mels.length; i++) {
-        for(j = 0; j < log_mels[i].length; j++) {
+    for(let i = 0; i < log_mels.length; i++) {
+        for(let j = 0; j < log_mels[i].length; j++) {
             flatten_arry.push((Math.log(log_mels[i][j] + bias) - zmuv_mean) / zmuv_std)
         }
     }
@@ -126,6 +129,10 @@ function softmax(arr) {
       return Math.exp(value) / arr.map( function(y /*value*/){ return Math.exp(y) } ).reduce( function(a,b){ return a+b })
     })
 }
+
+const padArray = function(arr,len,fill) {
+    return arr.concat(Array(len).fill(fill)).slice(0,len);
+ }
 
 function gotStream(stream) {
     inputPoint = audioContext.createGain();
@@ -144,56 +151,73 @@ function gotStream(stream) {
     // bufferSize, in_channels, out_channels
     scriptNode = (audioContext.createScriptProcessor || audioContext.createJavaScriptNode).call(audioContext, bufferSize, channels, channels);
     scriptNode.onaudioprocess = async function (audioEvent) {
-        if (recording) {
+        if (recording && !pauseStreaming) {
             let resampledMonoAudio = await resampleAndMakeMono(audioEvent.inputBuffer);
             arrayBuffer = [...arrayBuffer, ...resampledMonoAudio]
+            batchSize = Math.ceil(arrayBuffer.length/windowBufferSize)
+            // if we got batches * 750 ms seconds of buffer 
+            if (arrayBuffer.length >= numOfBatches * windowBufferSize) {
+                pauseStreaming = true
+                console.log('streaming is paused')
+                let batch = 0
+                let dataProcessed;
+                for (let i = 0; i < arrayBuffer.length; i = i + windowBufferSize) {
+                    batchBuffer = arrayBuffer.slice(i, i+windowBufferSize)
+                    //  if it is less than 750 ms then pad it with ones
+                    if (batchBuffer.length < windowBufferSize) {
+                        batchBuffer = padArray(batchBuffer, windowBufferSize, 1)
+                        //break
+                    }
+                    // arrayBuffer = arrayBuffer.filter(x => x/audioFloatSize)
+                    // calculate log mels
+                    log_mels = melSpectrogram(batchBuffer, {
+                        sampleRate: sampleRate,
+                        hopLength: SPEC_HOP_LENGTH,
+                        nMels: MEL_SPEC_BINS,
+                        nFft: NUM_FFTS
+                    });
+                    // we will get 61 arrays of each 40 length
+                    // convert to nd array of 61x40
+                    let nd_mels = ndarray(flatten(log_mels), [log_mels.length, MEL_SPEC_BINS])
+                    if (batch == 0) {
+                        // create empty [5,1,40,61] - This is model takes input
+                        dataProcessed = ndarray(new Float32Array(batchSize * MEL_SPEC_BINS * log_mels.length * channels), 
+                                    [batchSize, channels, MEL_SPEC_BINS, log_mels.length])
 
-            // if we got 750 ms seconds of buffer
-            if (arrayBuffer.length >= windowBufferSize) {
-                // trim if it is more than 750 ms
-                if (arrayBuffer.length / SAMPLE_RATE * 1000 > windowSize) {
-                    arrayBuffer = arrayBuffer.slice(0, windowBufferSize)
+                    }
+                    // convert [61, 40] to [batch, 1, 40, 61]
+                    ndarray.ops.assign(dataProcessed.pick(batch, 0, null, null), nd_mels.transpose(1,0).pick(null,  null));
+                    batch = batch + 1
                 }
-                // arrayBuffer = arrayBuffer.filter(x => x/audioFloatSize)
-                // calculate log mels
-                log_mels = melSpectrogram(arrayBuffer, {
-                    sampleRate: SAMPLE_RATE,
-                    hopLength: SPEC_HOP_LENGTH,
-                    nMels: MEL_SPEC_BINS,
-                    nFft: NUM_FFTS
-                });
-                // we will get 61 arrays of each 40 length
-                // convert to nd array of 61x40
-                let nd_mels = ndarray(flatten(log_mels), [log_mels.length, MEL_SPEC_BINS])
-                // create empty [1,1,40,61] - This is model takes input
-                let dataProcessed = ndarray(new Float32Array(MEL_SPEC_BINS * log_mels.length * channels), [1, channels, MEL_SPEC_BINS, log_mels.length])
-                // convert [61, 40] to [1, 1, 40, 61]
-                ndarray.ops.assign(dataProcessed.pick(0, 0, null, null), nd_mels.transpose(1,0).pick(null,  null));
+                // clear buffer
+                arrayBuffer = []
                 let inputTensor = new onnx.Tensor(dataProcessed.data, 'float32', dataProcessed.shape);
                 // Run model with Tensor inputs and get the result.
                 let outputMap = await session.run([inputTensor]);
                 let outputData = outputMap.values().next().value.data;
-                let scores = Array.from(outputData)
-                // add weights
-                console.log("scores", scores)
-                let probs = softmax(scores)
-                probs_sum = probs.reduce( (sum, x) => x+sum)
-                probs = probs.filter(x => x/probs_sum)
-                let class_idx = argMax(probs)
-                console.log("probabilities", probs)
-                console.log("predicted word", wakeWords[class_idx])
-                if (wakeWords[targetState] == wakeWords[class_idx]) {
-                    console.log(wakeWords[class_idx])
-                    addprediction(wakeWords[class_idx])
-                    predictWords.push(wakeWords[class_idx]) 
-                    targetState += 1
-                    if (wakeWords.join(' ') == predictWords.join(' ')) {
-                        addprediction(`Wake word detected - ${predictWords.join(' ')}`)
-                        predictWords = []
-                        targetState = 0
+                for (let i = 0; i<outputData.length; i = i+classes.length) {
+                    let scores = Array.from(outputData.slice(i,i+classes.length))
+                    console.log("scores", scores)
+                    let probs = softmax(scores)
+                    probs_sum = probs.reduce( (sum, x) => x+sum)
+                    probs = probs.filter(x => x/probs_sum)
+                    let class_idx = argMax(probs)
+                    console.log("probabilities", probs)
+                    console.log("predicted word", classes[class_idx])
+                    if (classes[targetState] == classes[class_idx]) {
+                        console.log(classes[class_idx])
+                        addprediction(classes[class_idx])
+                        predictWords.push(classes[class_idx]) 
+                        targetState += 1
+                        if (wakeWords.join(' ') == predictWords.join(' ')) {
+                            addprediction(`Wake word detected - ${predictWords.join(' ')}`)
+                            predictWords = []
+                            targetState = 0
+                        }
                     }
                 }
-                arrayBuffer = []
+                pauseStreaming = false
+                console.log('streaming is resumed')
             }
         }
     }
